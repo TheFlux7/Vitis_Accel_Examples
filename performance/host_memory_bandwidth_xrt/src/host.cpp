@@ -1,165 +1,174 @@
 /**
-* Copyright (C) 2019-2021 Xilinx, Inc
-*
-* Licensed under the Apache License, Version 2.0 (the "License"). You may
-* not use this file except in compliance with the License. A copy of the
-* License is located at
-*
-*     http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-* WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-* License for the specific language governing permissions and limitations
-* under the License.
-*/
+ * Copyright (C) 2019-2021 Xilinx, Inc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"). You may
+ * not use this file except in compliance with the License. A copy of the
+ * License is located at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
 
 #include "xcl2.hpp"
 #include "cmdlineparser.h"
 #include <cstring>
 #include <iostream>
+#include <thread>
+#include <vector>
+#include <numeric>
+#include <future>
 
 // XRT includes
 #include "experimental/xrt_bo.h"
 #include "experimental/xrt_device.h"
 #include "experimental/xrt_kernel.h"
 
-int main(int argc, char* argv[]) {
+std::vector<double> run_write_bandwidth(std::string binaryFile, int device_index, int repeat)
+{
+    int iter = 1;
+    std::vector<double> throughputs_GBps;
+    throughputs_GBps.reserve(repeat);
+
+    std::cout << "Open the device " << device_index << std::endl;
+    auto device = xrt::device(device_index);
+    std::cout << "Load the xclbin " << binaryFile << std::endl;
+    auto uuid = device.load_xclbin(binaryFile);
+
+    auto krnl_write = xrt::kernel(device, uuid, "write_bandwidth");
+
+    size_t bufsize = 512 * 1024 * 1024;
+
+    xrt::bo::flags flags = xrt::bo::flags::host_only;
+    auto hostonly_bo_out = xrt::bo(device, bufsize, flags, krnl_write.group_id(0));
+
+    double dbytes = bufsize;
+
+    // Map the contents of the buffer object into host memory
+    auto hostonly_bo_out_map = hostonly_bo_out.map<char *>();
+
+    std::fill(hostonly_bo_out_map, hostonly_bo_out_map + bufsize, 0);
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < repeat; i++)
+    {
+        if (xcl::is_emulation())
+        {
+            iter = 2;
+            if (bufsize > 8 * 1024)
+                break;
+        }
+
+        auto run_write = krnl_write(hostonly_bo_out, bufsize, iter);
+        run_write.wait();
+
+        auto end = std::chrono::high_resolution_clock::now();
+        double duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        start = end;
+        double msduration = duration / iter;
+
+        /* Profiling information */
+        double dsduration = msduration / ((double)1000000);
+        double bpersec = (dbytes / dsduration);
+        double gbpersec = (bpersec) / ((double)1024 * 1024 * 1024);
+
+        throughputs_GBps.push_back(gbpersec);
+
+        // std::cout << "Write Throughput = " << gbpersec << " (GB/sec) for device " << device_index << "\n";
+    }
+
+    return throughputs_GBps;
+}
+
+std::vector<double> run_sync(std::string binaryFile, int device_index, int repeat)
+{
+    std::vector<double> throughputs_GBps;
+    throughputs_GBps.reserve(repeat);
+
+    std::cout << "Open the device " << device_index << std::endl;
+    auto device = xrt::device(device_index);
+    std::cout << "Load the xclbin " << binaryFile << device_index << std::endl;
+    auto uuid = device.load_xclbin(binaryFile);
+
+    auto krnl_read = xrt::kernel(device, uuid, "read_bandwidth");
+
+    size_t bufsize = 512 * 1024 * 1024;
+
+    auto bo_out = xrt::bo(device, bufsize, xrt::bo::flags::normal, krnl_read.group_id(0));
+    auto bo_out_map = bo_out.map<char *>();
+    double dbytes = bufsize;
+
+    std::fill(bo_out_map, bo_out_map + bufsize, 0);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < repeat; i++)
+    {
+        if (xcl::is_emulation())
+        {
+            if (bufsize > 8 * 1024)
+                break;
+        }
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        auto end = std::chrono::high_resolution_clock::now();
+        double duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        double msduration = duration;
+        start = end;
+
+        /* Profiling information */
+        double dsduration = msduration / ((double)1000000);
+        double bpersec = (dbytes / dsduration);
+        double gbpersec = (bpersec) / ((double)1024 * 1024 * 1024);
+
+        throughputs_GBps.push_back(gbpersec);
+
+        // std::cout << "Write Throughput = " << gbpersec << " (GB/sec) for device " << device_index << "\n";
+    }
+
+    return throughputs_GBps;
+}
+
+int main(int argc, char *argv[])
+{
     // Command Line Parser
     sda::utils::CmdLineParser parser;
 
     // Switches
     //**************//"<Full Arg>",  "<Short Arg>", "<Description>", "<Default>"
     parser.addSwitch("--xclbin_file", "-x", "input binary file string", "");
-    parser.addSwitch("--device_id", "-d", "device index", "0");
     parser.parse(argc, argv);
 
     // Read settings
     std::string binaryFile = parser.value("xclbin_file");
-    int device_index = stoi(parser.value("device_id"));
 
-    if (argc < 3) {
+    if (argc < 2)
+    {
         parser.printHelp();
         return EXIT_FAILURE;
     }
 
-    std::cout << "Open the device" << device_index << std::endl;
-    auto device = xrt::device(device_index);
-    std::cout << "Load the xclbin " << binaryFile << std::endl;
-    auto uuid = device.load_xclbin(binaryFile);
-
-    auto krnl = xrt::kernel(device, uuid, "bandwidth");
-    auto krnl_read = xrt::kernel(device, uuid, "read_bandwidth");
-    auto krnl_write = xrt::kernel(device, uuid, "write_bandwidth");
-
-    double concurrent_max = 0;
-    double read_max = 0;
-    double write_max = 0;
-
-    for (size_t i = 4 * 1024; i <= 64 * 1024 * 1024; i *= 2) {
-        size_t iter = (64 * 1024 * 1024) / i;
-        size_t bufsize = i;
-
-        if (xcl::is_emulation()) {
-            iter = 2;
-            if (bufsize > 8 * 1024) break;
-        }
-
-        /* Input buffer */
-        unsigned char* input_host = ((unsigned char*)malloc(bufsize));
-        if (input_host == NULL) {
-            std::cout << "Error: Failed to allocate host side copy of "
-                      << "buffer of size " << bufsize << std::endl;
-            return EXIT_FAILURE;
-        }
-
-        for (size_t i = 0; i < bufsize; i++) {
-            input_host[i] = i % 256;
-        }
-
-        xrt::bo::flags flags = xrt::bo::flags::host_only;
-        auto hostonly_bo_in = xrt::bo(device, bufsize, flags, krnl.group_id(0));
-        auto hostonly_bo_out = xrt::bo(device, bufsize, flags, krnl.group_id(1));
-
-        double dbytes = bufsize;
-        std::string size_str = xcl::convert_size(bufsize);
-
-        // Map the contents of the buffer object into host memory
-        auto bo_in_map = hostonly_bo_in.map<char*>();
-        auto bo_out_map = hostonly_bo_out.map<char*>();
-
-        std::fill(bo_in_map, bo_in_map + bufsize, 0);
-        std::fill(bo_out_map, bo_out_map + bufsize, 0);
-
-        // Create the test data
-        for (size_t i = 0; i < bufsize; ++i) {
-            bo_in_map[i] = input_host[i];
-        }
-
-        auto start = std::chrono::high_resolution_clock::now();
-        auto run = krnl(hostonly_bo_in, hostonly_bo_out, bufsize, iter);
-        run.wait();
-        auto end = std::chrono::high_resolution_clock::now();
-        double duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-        double msduration = duration / iter;
-
-        // Validate our results
-        if (std::memcmp(bo_out_map, bo_in_map, bufsize))
-            throw std::runtime_error("Value read back does not match reference");
-
-        /* Profiling information */
-        double dsduration = msduration / ((double)1000000);
-        double bpersec = (dbytes / dsduration);
-        double gbpersec = (2 * bpersec) / ((double)1024 * 1024 * 1024); // For Concurrent Read and Write
-
-        std::cout << "Concurrent Read and Write Throughput = " << gbpersec << " (GB/sec) for buffer size " << size_str
-                  << std::endl;
-
-        if (gbpersec > concurrent_max) {
-            concurrent_max = gbpersec;
-        }
-
-        start = std::chrono::high_resolution_clock::now();
-        auto run_read = krnl_read(hostonly_bo_in, bufsize, iter);
-        run_read.wait();
-        end = std::chrono::high_resolution_clock::now();
-        duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-        msduration = duration / iter;
-
-        /* Profiling information */
-        dsduration = msduration / ((double)1000000);
-        bpersec = (dbytes / dsduration);
-        gbpersec = (bpersec) / ((double)1024 * 1024 * 1024);
-
-        std::cout << "Read Throughput = " << gbpersec << " (GB/sec) for buffer size " << size_str << std::endl;
-
-        if (gbpersec > read_max) {
-            read_max = gbpersec;
-        }
-
-        start = std::chrono::high_resolution_clock::now();
-        auto run_write = krnl_write(hostonly_bo_out, bufsize, iter);
-        run_write.wait();
-        end = std::chrono::high_resolution_clock::now();
-        duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-        msduration = duration / iter;
-
-        /* Profiling information */
-        dsduration = msduration / ((double)1000000);
-        bpersec = (dbytes / dsduration);
-        gbpersec = (bpersec) / ((double)1024 * 1024 * 1024);
-
-        std::cout << "Write Throughput = " << gbpersec << " (GB/sec) for buffer size " << size_str << "\n\n";
-
-        if (gbpersec > write_max) {
-            write_max = gbpersec;
-        }
+    std::vector<std::future<std::vector<double>>> run_write_bandwidth_futures;
+    for (size_t i = 0; i < 8; i++)
+    {
+        std::future<std::vector<double>> run_write_bandwidth_future = std::async(std::launch::async, run_write_bandwidth, binaryFile, i, 400);
+        run_write_bandwidth_futures.emplace_back(std::move(run_write_bandwidth_future));
     }
 
-    std::cout << "Maximum bandwidth achieved :\n";
-    std::cout << "Concurrent Read and Write Throughput = " << concurrent_max << " (GB/sec) \n";
-    std::cout << "Read Throughput = " << read_max << " (GB/sec) \n";
-    std::cout << "Write Throughput = " << write_max << " (GB/sec) \n\n";
-    std::cout << "TEST PASSED\n";
+    int i = 0;
+    for (auto &run_write_bandwidth_future : run_write_bandwidth_futures)
+    {
+        auto throughputs_GBps = run_write_bandwidth_future.get();
+        std::ofstream output_file("./device" + std::to_string(i) + ".txt");
+
+        std::ostream_iterator<double> output_iterator(output_file, "\n");
+        std::copy(std::begin(throughputs_GBps), std::end(throughputs_GBps), output_iterator);
+        i++;
+    }
+
     return EXIT_SUCCESS;
 }
